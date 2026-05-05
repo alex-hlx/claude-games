@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>坦克大战 - 中日对决</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #111;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  color: #fff;
+}
+#ui {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: #1e1e1e;
+  border: 1px solid #333;
+  border-bottom: none;
+  width: 900px;
+  flex-wrap: wrap;
+}
+#count-ctrl { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.btn {
+  padding: 4px 12px;
+  background: #333;
+  border: 1px solid #555;
+  color: #fff;
+  cursor: pointer;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.btn:hover { background: #444; }
+#btn-start { background: #1a5c1a; border-color: #2a8c2a; font-size: 13px; padding: 5px 16px; }
+#btn-start:hover { background: #236b23; }
+.weapon-btn { transition: all 0.1s; }
+.weapon-btn.active { background: #cc7700; border-color: #ffaa00; color: #fff; }
+#hint { font-size: 11px; color: #666; margin-left: auto; }
+#status { font-size: 13px; color: #aaa; min-width: 180px; text-align: right; }
+canvas { display: block; cursor: crosshair; border: 1px solid #333; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="count-ctrl">
+    <span>每方兵力:</span>
+    <button class="btn" id="btn-minus">−</button>
+    <span id="count-disp" style="min-width:16px;text-align:center">3</span>
+    <button class="btn" id="btn-plus">+</button>
+  </div>
+  <button class="btn" id="btn-start">▶ 开始游戏</button>
+  <span style="color:#555;font-size:12px">武器:</span>
+  <button class="weapon-btn btn active" id="w0">1. 主炮</button>
+  <button class="weapon-btn btn" id="w1">2. 小炮</button>
+  <button class="weapon-btn btn" id="w2">3. 机枪</button>
+  <div id="hint">WASD移动 | 鼠标瞄准 | 左键/按住射击 | 1/2/3换武器</div>
+  <div id="status">—</div>
+</div>
+<canvas id="c" width="900" height="580"></canvas>
+
+<script>
+const W = 900, H = 580;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// ── Weapon configs ──────────────────────────────────────────────
+const WEAPONS = [
+  { name:'主炮', damage:55, rate:1800, spd:380, r:8,  explR:35, color:'#ff5500' },
+  { name:'小炮', damage:22, rate:550,  spd:480, r:5,  explR:18, color:'#ffaa00' },
+  { name:'机枪', damage:6,  rate:100,  spd:620, r:2.5,explR:8,  color:'#ffff55' },
+];
+
+const TANK_SPD = 95;
+const TURN_SPD = 2.2;
+const TUR_SPD  = 3.5;
+const TANK_R   = 22; // collision radius
+
+// ── Obstacle map (static rectangles) ───────────────────────────
+const OBSTACLES = [
+  {x:310, y:130, w:50, h:120},
+  {x:540, y:130, w:50, h:120},
+  {x:310, y:330, w:50, h:120},
+  {x:540, y:330, w:50, h:120},
+  {x:420, y:240, w:60, h:100},
+];
+
+function obstacleBlocks(x, y, r) {
+  for (const o of OBSTACLES) {
+    const cx = Math.max(o.x, Math.min(o.x+o.w, x));
+    const cy = Math.max(o.y, Math.min(o.y+o.h, y));
+    if ((cx-x)**2 + (cy-y)**2 < r*r) return true;
+  }
+  return false;
+}
+
+// ── Explosion ───────────────────────────────────────────────────
+class Explosion {
+  constructor(x, y, r) {
+    this.x=x; this.y=y; this.maxR=r;
+    this.t=0; this.dur=0.45; this.done=false;
+  }
+  update(dt) {
+    this.t += dt/this.dur;
+    if (this.t >= 1) this.done = true;
+  }
+  draw() {
+    const r = this.maxR * this.t;
+    const a = 1 - this.t;
+    ctx.save();
+    ctx.globalAlpha = a;
+    const g = ctx.createRadialGradient(this.x,this.y,0,this.x,this.y,r);
+    g.addColorStop(0,'#fff');
+    g.addColorStop(0.25,'#ffcc00');
+    g.addColorStop(0.6,'#ff4400');
+    g.addColorStop(1,'rgba(200,50,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(this.x,this.y,r,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── Bullet ──────────────────────────────────────────────────────
+class Bullet {
+  constructor(x, y, angle, wpn, faction) {
+    this.x=x; this.y=y;
+    this.vx=Math.cos(angle)*wpn.spd;
+    this.vy=Math.sin(angle)*wpn.spd;
+    this.r=wpn.r; this.dmg=wpn.damage;
+    this.explR=wpn.explR; this.color=wpn.color;
+    this.faction=faction; this.dead=false;
+  }
+  update(dt) {
+    this.x += this.vx*dt;
+    this.y += this.vy*dt;
+    if (this.x<0||this.x>W||this.y<0||this.y>H) this.dead=true;
+    if (obstacleBlocks(this.x, this.y, this.r+2)) this.dead=true;
+  }
+  draw() {
+    ctx.save();
+    ctx.shadowColor=this.color; ctx.shadowBlur=8;
+    ctx.fillStyle=this.color;
+    ctx.beginPath();
+    ctx.arc(this.x,this.y,this.r,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── Tank ────────────────────────────────────────────────────────
+let tankIdCounter = 0;
+class Tank {
+  constructor(x, y, faction, isPlayer) {
+    this.id = tankIdCounter++;
+    this.x=x; this.y=y;
+    this.faction=faction; this.isPlayer=isPlayer;
+    this.angle = faction==='china' ? 0 : Math.PI;
+    this.turAngle = this.angle;
+    this.hp=100; this.maxHp=100;
+    this.wIdx=0;
+    this.lastFire=0;
+    this.dead=false;
+    // AI
+    this.aiTimer=0;
+    this.strafeDir=1;
+    this.stuckTimer=0;
+    this.prevX=x; this.prevY=y;
+  }
+  get wpn() { return WEAPONS[this.wIdx]; }
+
+  draw() {
+    if (this.dead) return;
+    const {x,y,angle,turAngle,faction} = this;
+    const isChina = faction==='china';
+    const bodyColor = isChina ? '#3d7a3d' : '#7a7a7a';
+    const trackColor = isChina ? '#2a5a2a' : '#5a5a5a';
+    const turretColor = isChina ? '#2d6a2d' : '#6a6a6a';
+
+    ctx.save();
+    ctx.translate(x,y);
+
+    // Shadow
+    ctx.save();
+    ctx.globalAlpha=0.25;
+    ctx.fillStyle='#000';
+    ctx.beginPath();
+    ctx.ellipse(4,5,24,17,angle,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.rotate(angle);
+
+    // Tracks
+    ctx.fillStyle=trackColor;
+    ctx.fillRect(-22,-18,44,7);
+    ctx.fillRect(-22,11,44,7);
+    // Track detail
+    ctx.strokeStyle='rgba(0,0,0,0.4)';
+    ctx.lineWidth=1;
+    for (let i=-20;i<22;i+=6) {
+      ctx.beginPath();
+      ctx.moveTo(i,-18); ctx.lineTo(i,-11);
+      ctx.moveTo(i,11);  ctx.lineTo(i,18);
+      ctx.stroke();
+    }
+
+    // Body
+    ctx.fillStyle=bodyColor;
+    ctx.fillRect(-20,-12,40,24);
+
+    // Faction emblem
+    ctx.save();
+    ctx.font='bold 15px serif';
+    ctx.textAlign='center';
+    ctx.textBaseline='middle';
+    if (isChina) {
+      ctx.fillStyle='#cc0000';
+      ctx.fillText('★', 0, 0);
+    } else {
+      ctx.fillStyle='#cc0000';
+      ctx.beginPath();
+      ctx.arc(0,0,7,0,Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle='#fff';
+      ctx.beginPath();
+      ctx.arc(0,0,3,0,Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    ctx.restore();
+
+    // Turret
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.rotate(turAngle);
+    ctx.fillStyle=turretColor;
+    ctx.beginPath();
+    ctx.arc(0,0,12,0,Math.PI*2);
+    ctx.fill();
+    // Barrel
+    ctx.fillStyle='#222';
+    ctx.fillRect(2,-4,30,8);
+    ctx.fillStyle='#333';
+    ctx.fillRect(2,-3,30,6);
+    ctx.restore();
+
+    // Player ring
+    if (this.isPlayer) {
+      ctx.save();
+      ctx.translate(x,y);
+      ctx.strokeStyle='#00ffff';
+      ctx.lineWidth=2;
+      ctx.globalAlpha=0.7;
+      ctx.beginPath();
+      ctx.arc(0,0,26,0,Math.PI*2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // HP bar
+    const bw=44, bh=5;
+    const bx=x-bw/2, by=y-30;
+    ctx.fillStyle='rgba(0,0,0,0.5)';
+    ctx.fillRect(bx-1,by-1,bw+2,bh+2);
+    ctx.fillStyle=this.hp>50?'#22cc22':this.hp>25?'#ffaa00':'#cc2222';
+    ctx.fillRect(bx,by,bw*(this.hp/this.maxHp),bh);
+    ctx.strokeStyle='#555';
+    ctx.lineWidth=1;
+    ctx.strokeRect(bx,by,bw,bh);
+  }
+
+  fire(bullets, now) {
+    const w=this.wpn;
+    if (now - this.lastFire < w.rate) return false;
+    this.lastFire=now;
+    const blen=32;
+    const bx=this.x+Math.cos(this.turAngle)*blen;
+    const by=this.y+Math.sin(this.turAngle)*blen;
+    bullets.push(new Bullet(bx,by,this.turAngle,w,this.faction));
+    return true;
+  }
+
+  damage(dmg, explosions) {
+    if (this.dead) return;
+    this.hp -= dmg;
+    if (this.hp <= 0) {
+      this.hp=0; this.dead=true;
+      explosions.push(new Explosion(this.x,this.y,65));
+      explosions.push(new Explosion(
+        this.x+(Math.random()-.5)*25,
+        this.y+(Math.random()-.5)*25, 40));
+    }
+  }
+
+  tryMove(nx, ny) {
+    // Clamp to canvas
+    nx = Math.max(TANK_R+2, Math.min(W-TANK_R-2, nx));
+    ny = Math.max(TANK_R+2, Math.min(H-TANK_R-2, ny));
+    if (!obstacleBlocks(nx, ny, TANK_R+2)) {
+      this.x=nx; this.y=ny;
+    }
+  }
+
+  updateAI(dt, tanks, bullets, explosions, now) {
+    const enemies = tanks.filter(t=>!t.dead && t.faction!==this.faction);
+    if (!enemies.length) return;
+
+    // Pick nearest enemy
+    let target=null, bestD=Infinity;
+    for (const e of enemies) {
+      const d=Math.hypot(e.x-this.x,e.y-this.y);
+      if (d<bestD){bestD=d;target=e;}
+    }
+
+    const dx=target.x-this.x, dy=target.y-this.y;
+    const aimAngle=Math.atan2(dy,dx);
+    const dist=Math.hypot(dx,dy);
+
+    // Rotate turret
+    let td=aimAngle-this.turAngle;
+    while(td>Math.PI)td-=2*Math.PI;
+    while(td<-Math.PI)td+=2*Math.PI;
+    this.turAngle += Math.sign(td)*Math.min(Math.abs(td),TUR_SPD*dt);
+
+    const ATTACK_DIST=270;
+    if (dist > ATTACK_DIST) {
+      // Chase
+      let bd=aimAngle-this.angle;
+      while(bd>Math.PI)bd-=2*Math.PI;
+      while(bd<-Math.PI)bd+=2*Math.PI;
+      this.angle+=Math.sign(bd)*Math.min(Math.abs(bd),TURN_SPD*dt);
+      const nx=this.x+Math.cos(this.angle)*TANK_SPD*dt;
+      const ny=this.y+Math.sin(this.angle)*TANK_SPD*dt;
+      this.tryMove(nx,ny);
+    } else {
+      // Strafe
+      this.aiTimer-=dt;
+      if (this.aiTimer<=0) {
+        this.strafeDir*=-1;
+        this.aiTimer=1.5+Math.random()*2;
+      }
+      const strafeAngle=aimAngle+this.strafeDir*Math.PI/2;
+      let bd=strafeAngle-this.angle;
+      while(bd>Math.PI)bd-=2*Math.PI;
+      while(bd<-Math.PI)bd+=2*Math.PI;
+      this.angle+=Math.sign(bd)*Math.min(Math.abs(bd),TURN_SPD*dt);
+      const nx=this.x+Math.cos(this.angle)*TANK_SPD*0.6*dt;
+      const ny=this.y+Math.sin(this.angle)*TANK_SPD*0.6*dt;
+      this.tryMove(nx,ny);
+    }
+
+    // Fire if aimed
+    if (Math.abs(td)<0.18 && dist<420) {
+      this.fire(bullets, now);
+    }
+  }
+}
+
+// ── Game state ───────────────────────────────────────────────────
+let tanks=[], bullets=[], explosions=[];
+let playerTank=null;
+let mouseX=W/2, mouseY=H/2;
+let mouseDown=false;
+let keys={};
+let running=false, gameOver=false, gameOverMsg='';
+let playerCount=3;
+let lastTs=0;
+let lastFireTs=0;
+
+function spawnGame() {
+  tankIdCounter=0;
+  tanks=[]; bullets=[]; explosions=[];
+  gameOver=false; gameOverMsg='';
+
+  for (let i=0;i<playerCount;i++) {
+    const col = Math.floor(i/3);
+    const row = i%3;
+    const x = 70 + col*55;
+    const y = 90 + row*(H-180)/Math.max(playerCount-1,1);
+    const t=new Tank(x,y,'china', i===0);
+    if(i===0) playerTank=t;
+    tanks.push(t);
+  }
+  for (let i=0;i<playerCount;i++) {
+    const col = Math.floor(i/3);
+    const row = i%3;
+    const x = W-70-col*55;
+    const y = 90 + row*(H-180)/Math.max(playerCount-1,1);
+    tanks.push(new Tank(x,y,'japan',false));
+  }
+}
+
+function setWeapon(idx) {
+  if (playerTank) playerTank.wIdx=idx;
+  document.querySelectorAll('.weapon-btn').forEach((b,i)=>
+    b.classList.toggle('active',i===idx));
+}
+
+// ── Input ────────────────────────────────────────────────────────
+canvas.addEventListener('mousemove',e=>{
+  const r=canvas.getBoundingClientRect();
+  mouseX=e.clientX-r.left; mouseY=e.clientY-r.top;
+});
+canvas.addEventListener('mousedown',e=>{ if(e.button===0) mouseDown=true; });
+canvas.addEventListener('mouseup',  e=>{ if(e.button===0) mouseDown=false; });
+canvas.addEventListener('mouseleave',()=>{ mouseDown=false; });
+document.addEventListener('keydown',e=>{
+  keys[e.key.toLowerCase()]=true;
+  if(e.key==='1') setWeapon(0);
+  if(e.key==='2') setWeapon(1);
+  if(e.key==='3') setWeapon(2);
+});
+document.addEventListener('keyup',e=>{ keys[e.key.toLowerCase()]=false; });
+
+document.getElementById('btn-minus').onclick=()=>{
+  if(playerCount>1){ playerCount--; document.getElementById('count-disp').textContent=playerCount; }
+};
+document.getElementById('btn-plus').onclick=()=>{
+  if(playerCount<8){ playerCount++; document.getElementById('count-disp').textContent=playerCount; }
+};
+document.getElementById('btn-start').onclick=()=>{
+  spawnGame();
+  if(!running){ running=true; requestAnimationFrame(loop); }
+};
+document.getElementById('w0').onclick=()=>setWeapon(0);
+document.getElementById('w1').onclick=()=>setWeapon(1);
+document.getElementById('w2').onclick=()=>setWeapon(2);
+
+// ── Draw background ──────────────────────────────────────────────
+function drawBG() {
+  // Grass
+  ctx.fillStyle='#2a5518';
+  ctx.fillRect(0,0,W,H);
+  // Subtle texture
+  ctx.strokeStyle='rgba(0,0,0,0.08)';
+  ctx.lineWidth=1;
+  for(let x=0;x<W;x+=40){
+    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();
+  }
+  for(let y=0;y<H;y+=40){
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
+  }
+
+  // Center divider
+  ctx.save();
+  ctx.setLineDash([12,8]);
+  ctx.strokeStyle='rgba(255,255,255,0.1)';
+  ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(W/2,0); ctx.lineTo(W/2,H); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // Faction labels
+  ctx.font='bold 22px Microsoft YaHei, sans-serif';
+  ctx.textAlign='center';
+  ctx.textBaseline='top';
+  ctx.fillStyle='rgba(255,80,80,0.35)';
+  ctx.fillText('中 方', W/4, 8);
+  ctx.fillStyle='rgba(200,200,200,0.35)';
+  ctx.fillText('日 方', W*3/4, 8);
+}
+
+function drawObstacles() {
+  for (const o of OBSTACLES) {
+    // Shadow
+    ctx.fillStyle='rgba(0,0,0,0.3)';
+    ctx.fillRect(o.x+3,o.y+3,o.w,o.h);
+    // Wall
+    ctx.fillStyle='#7a6a50';
+    ctx.fillRect(o.x,o.y,o.w,o.h);
+    // Top face
+    ctx.fillStyle='#9a8a68';
+    ctx.fillRect(o.x,o.y,o.w,8);
+    // Border
+    ctx.strokeStyle='#5a4a30';
+    ctx.lineWidth=1.5;
+    ctx.strokeRect(o.x,o.y,o.w,o.h);
+    // Brick lines
+    ctx.strokeStyle='rgba(0,0,0,0.2)';
+    ctx.lineWidth=1;
+    for(let iy=o.y+16;iy<o.y+o.h;iy+=16){
+      ctx.beginPath();ctx.moveTo(o.x,iy);ctx.lineTo(o.x+o.w,iy);ctx.stroke();
+    }
+  }
+}
+
+// ── Update ───────────────────────────────────────────────────────
+function update(dt, now) {
+  if (gameOver) return;
+
+  // Player control
+  if (playerTank && !playerTank.dead) {
+    const p=playerTank;
+    const left  = keys['a']||keys['arrowleft'];
+    const right = keys['d']||keys['arrowright'];
+    const fwd   = keys['w']||keys['arrowup'];
+    const back  = keys['s']||keys['arrowdown'];
+
+    if (left)  p.angle -= TURN_SPD*dt;
+    if (right) p.angle += TURN_SPD*dt;
+    if (fwd) {
+      p.tryMove(
+        p.x+Math.cos(p.angle)*TANK_SPD*dt,
+        p.y+Math.sin(p.angle)*TANK_SPD*dt);
+    }
+    if (back) {
+      p.tryMove(
+        p.x-Math.cos(p.angle)*TANK_SPD*0.6*dt,
+        p.y-Math.sin(p.angle)*TANK_SPD*0.6*dt);
+    }
+
+    // Aim turret at mouse
+    p.turAngle=Math.atan2(mouseY-p.y,mouseX-p.x);
+
+    // Fire
+    if (mouseDown) {
+      p.fire(bullets, now);
+    }
+  }
+
+  // AI
+  for (const t of tanks) {
+    if (!t.isPlayer && !t.dead) {
+      t.updateAI(dt, tanks, bullets, explosions, now);
+    }
+  }
+
+  // Update bullets
+  for (const b of bullets) b.update(dt);
+
+  // Bullet-tank collisions
+  for (const b of bullets) {
+    if (b.dead) continue;
+    for (const t of tanks) {
+      if (t.dead || t.faction===b.faction) continue;
+      if (Math.hypot(b.x-t.x,b.y-t.y) < TANK_R+b.r) {
+        b.dead=true;
+        t.damage(b.dmg, explosions);
+        explosions.push(new Explosion(b.x,b.y,b.explR));
+        break;
+      }
+    }
+  }
+
+  // Update explosions
+  for (const e of explosions) e.update(dt);
+
+  // Cleanup
+  bullets    = bullets.filter(b=>!b.dead);
+  explosions = explosions.filter(e=>!e.done);
+
+  // Win check
+  const ca=tanks.filter(t=>t.faction==='china'&&!t.dead).length;
+  const ja=tanks.filter(t=>t.faction==='japan'&&!t.dead).length;
+  if (ca===0||ja===0) {
+    gameOver=true;
+    gameOverMsg = ca===0 ? '日方胜利！' : '中方胜利！';
+  }
+
+  // Status bar
+  const wp = playerTank&&!playerTank.dead ? WEAPONS[playerTank.wIdx].name : '—';
+  const hp = playerTank ? playerTank.hp : 0;
+  document.getElementById('status').textContent =
+    `中方: ${ca} 辆 | 日方: ${ja} 辆 | 武器: ${wp} | 血量: ${hp}`;
+}
+
+// ── Draw ─────────────────────────────────────────────────────────
+function draw() {
+  ctx.clearRect(0,0,W,H);
+  drawBG();
+  drawObstacles();
+
+  for (const b of bullets)    b.draw();
+  for (const e of explosions) e.draw();
+  for (const t of tanks)      t.draw();
+
+  if (gameOver) {
+    ctx.fillStyle='rgba(0,0,0,0.65)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.textBaseline='middle';
+    ctx.font='bold 64px Microsoft YaHei, sans-serif';
+    ctx.fillStyle='#ffdd00';
+    ctx.shadowColor='#ff8800'; ctx.shadowBlur=20;
+    ctx.fillText(gameOverMsg,W/2,H/2-30);
+    ctx.shadowBlur=0;
+    ctx.font='22px Microsoft YaHei, sans-serif';
+    ctx.fillStyle='#ccc';
+    ctx.fillText('点击「开始游戏」重新开始',W/2,H/2+30);
+  }
+}
+
+// ── Loop ─────────────────────────────────────────────────────────
+function loop(ts) {
+  const dt=Math.min((ts-lastTs)/1000,0.05);
+  lastTs=ts;
+  update(dt,ts);
+  draw();
+  if (running) requestAnimationFrame(loop);
+}
+
+// Initial screen
+drawBG();
+drawObstacles();
+ctx.textAlign='center';
+ctx.textBaseline='middle';
+ctx.font='bold 28px Microsoft YaHei, sans-serif';
+ctx.fillStyle='rgba(255,255,255,0.8)';
+ctx.fillText('调整每方兵力后，点击「开始游戏」',W/2,H/2);
+ctx.font='16px Microsoft YaHei, sans-serif';
+ctx.fillStyle='rgba(200,200,200,0.5)';
+ctx.fillText('WASD 移动 | 鼠标瞄准 | 左键/按住 射击 | 1/2/3 切换武器',W/2,H/2+40);
+</script>
+</body>
+</html>
